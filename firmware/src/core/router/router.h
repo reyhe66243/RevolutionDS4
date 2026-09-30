@@ -1,0 +1,313 @@
+// router.h
+// REVOLUTIONDS4 input router - zero-latency N:M input/output routing
+//
+// Replaces console-specific post_input_event() with unified routing system.
+// Supports 4 modes: Simple (1:1), Merge (N:1), Broadcast (1:N), Configurable (N:M)
+
+#ifndef ROUTER_H
+#define ROUTER_H
+
+#include <stdint.h>
+#include <stdbool.h>
+#include "core/input_event.h"
+
+// ============================================================================
+// ROUTING MODES
+// ============================================================================
+
+typedef enum {
+    ROUTING_MODE_SIMPLE,        // 1:1 fixed
+    ROUTING_MODE_MERGE,         // N:1 merge inputs (Super3D0USB, current GCUSB all→port1)
+    ROUTING_MODE_BROADCAST,     // 1:N broadcast (MultiOut: USB → GC+USBD)
+    ROUTING_MODE_CONFIGURABLE,  // N:M user-defined (Universal app)
+} routing_mode_t;
+
+typedef enum {
+    MERGE_PRIORITY,             // High priority wins (USB before a native pad)
+    MERGE_BLEND,                // Blend button states (OR buttons together)
+    MERGE_ALL,                  // Latest active wins (current GCUSB behavior)
+} merge_mode_t;
+
+// ============================================================================
+// INPUT/OUTPUT SOURCES
+// ============================================================================
+
+typedef enum {
+    INPUT_SOURCE_USB_HOST,
+    INPUT_SOURCE_BLE_CENTRAL,
+    INPUT_SOURCE_WIFI,
+    INPUT_SOURCE_GPIO,
+    INPUT_SOURCE_SENSORS,
+    INPUT_SOURCE_I2C_PEER,
+    INPUT_SOURCE_UART_PEER,         // Inter-MCU UART link
+} input_source_t;
+
+typedef enum {
+    OUTPUT_TARGET_NONE = -1,        // No output configured
+    OUTPUT_TARGET_USB_DEVICE = 0,   // The USB device that the console reads
+    OUTPUT_TARGET_COUNT             // Must be last — used to size arrays
+} output_target_t;
+
+// ============================================================================
+// INPUT TRANSFORMATIONS
+// ============================================================================
+
+// Transformation flags (enable/disable per console)
+typedef enum {
+    TRANSFORM_NONE              = 0x00,
+    TRANSFORM_MOUSE_TO_ANALOG   = 0x01,  // Convert mouse deltas to an analog stick
+    TRANSFORM_MERGE_INSTANCES   = 0x02,  // Merge multi-instance devices
+    TRANSFORM_SPINNER           = 0x04,  // Accumulate the X axis for spinners
+} transformation_flags_t;
+
+// Mouse-to-analog accumulator state (per player)
+typedef struct {
+    int16_t accum_x;        // Accumulated X delta
+    int16_t accum_y;        // Accumulated Y delta
+    uint8_t drain_rate;     // How fast to drain per frame (0 = NO drain/hold, >0 = drain rate)
+    uint8_t target_x;       // Target analog axis for X (ANALOG_LX, ANALOG_RX, etc.)
+    uint8_t target_y;       // Target analog axis for Y (0xFF = disabled)
+} mouse_accumulator_t;
+
+// Special value to disable an axis in mouse-to-analog transform
+#define MOUSE_AXIS_DISABLED 0xFF
+
+// Instance merging state
+typedef struct {
+    bool active;            // Is this a merged device?
+    uint8_t instance_count; // How many instances are merged
+    uint8_t root_instance;  // Root instance ID
+} instance_merge_t;
+
+// ============================================================================
+// ROUTER CONFIGURATION
+// ============================================================================
+
+#define MAX_OUTPUTS OUTPUT_TARGET_COUNT
+// Overridable so RAM-constrained single-output targets (e.g. CH32V307 usb2usb,
+// 64KB SRAM) can shrink the per-output state arrays. Multi-output consoles
+// (a pad/PCE multitap) need 8; a USB-HID adapter needs far fewer.
+#ifndef MAX_PLAYERS_PER_OUTPUT
+#define MAX_PLAYERS_PER_OUTPUT 8
+#endif
+
+typedef struct {
+    routing_mode_t mode;
+    merge_mode_t merge_mode;
+    uint8_t max_players_per_output[MAX_OUTPUTS];  // Per-output limits (GC=4, a pad=8, PCE=5)
+    bool merge_all_inputs;                        // Merge all inputs to single output (current GC)
+
+    // Input transformations (Phase 5)
+    uint8_t transform_flags;                      // Which transformations to enable (bitfield)
+    uint8_t mouse_drain_rate;                     // Mouse accumulator drain rate (0 = NO drain/hold, >0 = drain)
+    uint8_t mouse_target_x;                       // Target axis for mouse X (default: ANALOG_LX)
+    uint8_t mouse_target_y;                       // Target axis for mouse Y (MOUSE_AXIS_DISABLED to disable)
+} router_config_t;
+
+// ============================================================================
+// ROUTER INITIALIZATION
+// ============================================================================
+
+// Initialize router with configuration
+void router_init(const router_config_t* config);
+
+// ============================================================================
+// INPUT SUBMISSION (Core 0 - Event Driven, replaces post_input_event)
+// ============================================================================
+
+// Called immediately when input arrives (USB report, BT report, etc.)
+// Processes event and updates output state atomically
+// NOTE: This is the ONLY function input drivers should call!
+void router_submit_input(const input_event_t* event);
+
+// Milliseconds since the last "active" input (button held or stick off-center)
+// across all sources. Used for idle / auto-sleep timeouts.
+uint32_t router_ms_since_activity(void);
+
+// This device's OWN battery (controller-style apps with an onboard LiPo). The
+// router stamps it into output states that have no input-device battery, so the
+// The report carries real charge_level/plug_status. percent <0 = no battery.
+void router_set_onboard_battery(int percent, bool charging);
+int  router_onboard_battery_percent(void);
+bool router_onboard_battery_charging(void);
+
+// Last-reported battery for a routed input device (by dev_addr). Returns true
+// and fills level (0-100) / charging when available; level 0 = not reported.
+bool router_get_device_battery(uint8_t dev_addr, uint8_t* level, bool* charging);
+
+// This device's OWN IMU motion (controller-style apps with an onboard IMU, e.g.
+// XIAO Sense LSM6DS3TR-C). Stamped into output states that have no input-device
+// motion, so the report carries accel/gyro. accel/gyro are int16 scaled
+// to the given full-scale ranges (accel_range in milli-g, gyro_range in dps).
+void router_set_onboard_motion(const int16_t accel[3], const int16_t gyro[3],
+                               uint16_t accel_range, uint16_t gyro_range);
+
+// Read back the current onboard motion (for diagnostics). Returns false if no
+// onboard IMU has reported yet.
+bool router_onboard_motion_get(int16_t accel[3], int16_t gyro[3]);
+
+// Onboard IMU axis remap for mounting orientation. Each arg is a signed source
+// axis for the corresponding output axis: 1=+X 2=+Y 3=+Z, negative to invert
+// (e.g. router_set_motion_remap(-1,-2,3) flips X and Y for a 180° yaw mount).
+// Applied to accel and gyro together in router_set_onboard_motion(). 0 = leave
+// that axis unchanged. Defaults to identity {1,2,3}.
+void router_set_motion_remap(int x, int y, int z);
+void router_get_motion_remap(int out[3]);
+
+// Host-side synthetic input "press overlay" — buttons set via INPUT.INJECT
+// are OR'd into every real input event as it passes through the router.
+// Works in any routing mode (SIMPLE, MERGE, BROADCAST). Pass 0 to release.
+// Lets chat-driven button presses merge with the streamer's
+// real controller regardless of how the app is configured for player slots.
+void router_set_inject_buttons(uint32_t buttons);
+uint32_t router_get_inject_buttons(void);
+
+// Set global d-pad mode (applies to all inputs in router)
+// 0=d-pad, 1=left stick, 2=right stick
+void router_set_dpad_mode(uint8_t mode);
+
+// Set global shoulder swap (L1<->L2, R1<->R2) applied to all inputs.
+void router_set_shoulder_swap(bool on);
+
+// Live d-pad mode / shoulder-swap state (reflects hotkey + CDC changes at once).
+uint8_t router_get_dpad_mode(void);
+bool router_get_shoulder_swap(void);
+
+// Set button combo hotkeys (up to ROUTER_COMBO_MAX)
+// input_mask: buttons that must all be held (0 = disabled)
+// output_mask: upper byte = action, lower 22 bits = output buttons
+#define ROUTER_COMBO_MAX 8
+void router_set_combo(uint8_t index, uint32_t input_mask, uint32_t output_mask);
+// Restrict a combo to events from a specific controller layout
+// (controller_layout_t cast to uint8_t). 0 = LAYOUT_UNKNOWN = match any.
+// Lets one app give different controllers different hotkey modifiers
+// (e.g. one layout uses S2+dpad, another S1+dpad).
+void router_set_combo_layout(uint8_t index, uint8_t required_layout);
+
+// ============================================================================
+// OUTPUT RETRIEVAL (Core 1 - Poll or Event Driven)
+// ============================================================================
+
+// Get latest input state for this output+player (returns NULL if no update)
+// Lock-free read, zero-copy (returns pointer to internal state)
+const input_event_t* router_get_output(output_target_t output, uint8_t player_id);
+
+// Check if any player has new data (fast scan for multi-player outputs)
+bool router_has_updates(output_target_t output);
+
+// Get player count for this output
+uint8_t router_get_player_count(output_target_t output);
+
+// Get max-player capacity configured for this output (router_config.max_players_per_output)
+uint8_t router_get_max_players(output_target_t output);
+
+// ============================================================================
+// ROUTING TABLES (Phase 6)
+// ============================================================================
+
+#ifndef MAX_ROUTES
+#define MAX_ROUTES 32  // Maximum number of routes in routing table
+#endif
+
+// Route entry for N:M routing
+typedef struct {
+    input_source_t input;       // Input source (USB_HOST, BT, etc.)
+    output_target_t output;     // Output target
+    uint8_t priority;           // Priority (0 = highest, 255 = lowest)
+    bool active;                // Is this route active?
+
+    // Optional filters (0 = wildcard, matches all)
+    uint8_t input_dev_addr;     // Filter by USB device address
+    int8_t input_instance;      // Filter by device instance
+    uint8_t output_player_id;   // Target specific player slot (0xFF = auto-assign)
+} route_entry_t;
+
+// ============================================================================
+// ROUTING CONFIGURATION (called by apps at init or runtime)
+// ============================================================================
+
+// Add simple route (input → output mapping)
+// Returns true if route added successfully, false if table full
+bool router_add_route(input_source_t input, output_target_t output, uint8_t priority);
+
+// Add route with filters (advanced routing)
+bool router_add_route_filtered(const route_entry_t* route);
+
+// Remove specific route by index
+void router_remove_route(uint8_t route_index);
+
+// Clear all routes (for runtime reconfiguration)
+void router_clear_routes(void);
+
+// Get number of active routes
+uint8_t router_get_route_count(void);
+
+// Get route by index (for debugging/inspection)
+const route_entry_t* router_get_route(uint8_t route_index);
+
+// Set merge mode for output
+void router_set_merge_mode(output_target_t output, merge_mode_t mode);
+
+// Set active outputs (for broadcast mode)
+void router_set_active_outputs(output_target_t* outputs, uint8_t count);
+
+// Get primary active output (first in active outputs list)
+// Returns OUTPUT_TARGET_NONE if no outputs configured
+output_target_t router_get_primary_output(void);
+
+// Reset all output states to neutral (call when all controllers disconnect)
+void router_reset_outputs(void);
+
+// Clean up router state when a device disconnects
+// This clears the device's output state and removes it from blend tracking
+// Call this BEFORE removing the player from the player manager
+void router_device_disconnected(uint8_t dev_addr, int8_t instance);
+
+// ============================================================================
+// OUTPUT TAP (Push-based notification)
+// ============================================================================
+// For outputs that need push notification (UART) instead of polling
+
+// Tap callback - called when router updates output state
+// output: which output target
+// player_index: which player slot (0-based)
+// event: the updated input event
+typedef void (*router_tap_callback_t)(output_target_t output, uint8_t player_index,
+                                       const input_event_t* event);
+
+// Set tap callback for an output (NULL to disable)
+// Output still stores to router_outputs[] for polling via router_get_output()
+void router_set_tap(output_target_t output, router_tap_callback_t callback);
+
+// Set tap callback with exclusive mode — output is fully push-based,
+// router skips storing to router_outputs[] (avoids copy on hot path).
+// Use this when the output never calls router_get_output().
+void router_set_tap_exclusive(output_target_t output, router_tap_callback_t callback);
+
+// ============================================================================
+// INTERNAL STATE (exposed for debugging, don't modify directly)
+// ============================================================================
+
+// Output state structure (replaces players[] array)
+//
+// Cross-core handoff: Core 0 (input) produces, Core 1 (PIO console output)
+// consumes. `seq` is a seqlock version counter guarding `current_state` against
+// torn reads — the console could otherwise poll mid-write and get a frame with
+// some fields new and some stale (e.g. new buttons + old stick). Even = stable,
+// odd = write-in-progress; it increments by 2 per publish. A plain `volatile
+// uint32_t` (aligned 32-bit access is atomic on every target; RP2040's M0+ has
+// no CAS but needs none here — single writer per slot) plus __atomic_thread_fence
+// release/acquire barriers. Producers MUST write via router_publish(); consumers
+// read via router_get_output() (see router.c). Do not touch `current_state`
+// directly across cores.
+typedef struct {
+    input_event_t current_state;    // Latest event (seqlock-protected payload)
+    volatile uint32_t seq;           // Seqlock version (even=stable, odd=writing)
+    uint8_t player_id;               // Player slot assignment
+    input_source_t source;           // Source of this input (for priority)
+} output_state_t;
+
+// Get pointer to output state array (for debugging/testing)
+output_state_t* router_get_state_ptr(output_target_t output);
+
+#endif // ROUTER_H

@@ -1,0 +1,794 @@
+// core/services/storage/flash.c - Persistent settings storage in flash memory
+//
+// Uses dual-sector journaled storage for BT-safe writes:
+// - Two 4KB sectors = 32 x 256-byte slots total
+// - Each save writes to next empty slot (page program only, ~1ms)
+// - When one sector fills, erase the OTHER sector and continue there
+// - This allows sector erases while valid data remains readable
+// - No need to defer erases for BT - always safe to erase inactive sector
+
+#include "core/services/storage/flash.h"
+#include "pico/stdlib.h"
+#include "hardware/flash.h"
+#include "hardware/sync.h"
+#include "pico/multicore.h"
+#include "pico/flash.h"
+#include "tusb.h"
+#include <string.h>
+#include <stdio.h>
+
+// BT connection check (weak symbol - overridden when BT is enabled)
+// Note: With dual-sector design, we no longer need to defer erases for BT
+__attribute__((weak)) uint8_t btstack_classic_get_connection_count(void) { return 0; }
+
+// Helper to flush debug output before critical sections
+static void flush_output(void)
+{
+#if CFG_TUD_ENABLED
+    tud_task();
+    sleep_ms(20);
+    tud_task();
+#else
+    sleep_ms(20);
+#endif
+}
+
+// Flash memory layout
+// - RP2040/RP2350 flash is memory-mapped at XIP_BASE (0x10000000)
+// - BTstack uses 8KB (2 sectors) for Bluetooth bond storage
+// - We use TWO sectors before BTstack for settings storage (dual-sector journal)
+// - Flash writes require erasing entire 4KB sectors
+// - Flash page writes are 256-byte aligned
+//
+// Layout differs by platform:
+// - RP2040: BTstack at end of flash (last 2 sectors)
+// - RP2350 (A2): BTstack 1 sector from end (due to RP2350-E10 errata)
+//
+// Dual-sector layout (from end):
+//   [... code ...] [Sector B] [Sector A] [BTstack 8KB] [end]
+// Sector A is at the original offset (preserves existing user data on upgrade)
+
+#define SETTINGS_MAGIC 0x47435052  // settings block identifier (do not change: it is stored in flash)
+#define BTSTACK_FLASH_SIZE (FLASH_SECTOR_SIZE * 2)  // 8KB for BTstack
+
+#if PICO_RP2350 && PICO_RP2350_A2_SUPPORTED
+// RP2350 layout: [... | sector B | sector A | btstack (2 sectors) | reserved (1 sector)]
+#define FLASH_SECTOR_A_OFFSET (PICO_FLASH_SIZE_BYTES - FLASH_SECTOR_SIZE - BTSTACK_FLASH_SIZE - FLASH_SECTOR_SIZE)
+#define FLASH_SECTOR_B_OFFSET (FLASH_SECTOR_A_OFFSET - FLASH_SECTOR_SIZE)
+#else
+// RP2040 layout: [... | sector B | sector A | btstack (2 sectors)]
+#define FLASH_SECTOR_A_OFFSET (PICO_FLASH_SIZE_BYTES - BTSTACK_FLASH_SIZE - FLASH_SECTOR_SIZE)
+#define FLASH_SECTOR_B_OFFSET (FLASH_SECTOR_A_OFFSET - FLASH_SECTOR_SIZE)
+#endif
+
+// Journal configuration
+#define JOURNAL_SLOT_SIZE FLASH_PAGE_SIZE  // 256 bytes per slot
+#define SLOTS_PER_SECTOR (FLASH_SECTOR_SIZE / JOURNAL_SLOT_SIZE)  // 16 slots per sector
+#define TOTAL_SLOT_COUNT (SLOTS_PER_SECTOR * 2)  // 32 slots total
+#define SAVE_DEBOUNCE_MS 5000  // Wait 5 seconds after last change before writing
+
+// Pending save state
+static bool save_pending = false;
+static absolute_time_t last_change_time;
+static flash_t pending_settings;
+static uint32_t current_sequence = 0;  // Current sequence number
+
+// Runtime settings (loaded on init, updated on save)
+static flash_t runtime_settings;
+static bool runtime_settings_loaded = false;
+
+// Ephemeral PROFILE.APPLY override (RAM-only button_map) — see
+// flash_get_active_custom_profile() and the public flash_apply_ephemeral_*
+// functions further down for the full semantics.
+static custom_profile_t ephemeral_profile;
+static bool ephemeral_active = false;
+
+// Ephemeral PROFILE.SELECT override (RAM-only index, sidecar so a later
+// flash_save() can't accidentally persist it). -1 = no ephemeral selection.
+static int8_t ephemeral_active_idx = -1;
+
+// Runtime overlay (OVERLAY.SET) — RAM-only "live tweak" layer. Composes
+// on top of whatever profile is active. Fields with value 0 are skipped.
+static runtime_overlay_t overlay_slot;
+static bool overlay_active_flag = false;
+
+// Get flash offset for a slot index (0-31)
+// Slots 0-15 are in sector A, slots 16-31 are in sector B
+static uint32_t get_slot_offset(uint8_t slot_index)
+{
+    if (slot_index < SLOTS_PER_SECTOR) {
+        return FLASH_SECTOR_A_OFFSET + (slot_index * JOURNAL_SLOT_SIZE);
+    } else {
+        return FLASH_SECTOR_B_OFFSET + ((slot_index - SLOTS_PER_SECTOR) * JOURNAL_SLOT_SIZE);
+    }
+}
+
+// Get pointer to a journal slot (0-31)
+static const flash_t* get_slot(uint8_t slot_index)
+{
+    return (const flash_t*)(XIP_BASE + get_slot_offset(slot_index));
+}
+
+// Check if a slot is empty (erased state = 0xFFFFFFFF)
+static bool is_slot_empty(uint8_t slot_index)
+{
+    const flash_t* slot = get_slot(slot_index);
+    return slot->sequence == 0xFFFFFFFF;
+}
+
+// Find the newest valid entry (highest sequence number) across both sectors
+// Returns slot index (0-31), or -1 if no valid entries
+static int find_newest_slot(void)
+{
+    int newest_slot = -1;
+    uint32_t highest_seq = 0;
+
+    for (uint8_t i = 0; i < TOTAL_SLOT_COUNT; i++) {
+        const flash_t* slot = get_slot(i);
+
+        // Check for valid magic and non-empty sequence
+        if (slot->magic == SETTINGS_MAGIC && slot->sequence != 0xFFFFFFFF) {
+            if (newest_slot == -1 || slot->sequence > highest_seq) {
+                highest_seq = slot->sequence;
+                newest_slot = i;
+            }
+        }
+    }
+
+    return newest_slot;
+}
+
+// Find the next empty slot, searching from the sector containing newest data
+// Returns slot index (0-31), or -1 if both sectors are full (shouldn't happen)
+static int find_empty_slot(void)
+{
+    int newest = find_newest_slot();
+
+    // Determine which sector to search first (the one with newest data)
+    // If no data yet, start with sector A (preserves upgrade compatibility)
+    bool start_with_a = (newest < 0 || newest < SLOTS_PER_SECTOR);
+
+    if (start_with_a) {
+        // Search sector A first (slots 0-15)
+        for (uint8_t i = 0; i < SLOTS_PER_SECTOR; i++) {
+            if (is_slot_empty(i)) {
+                return i;
+            }
+        }
+        // Sector A full - search sector B (slots 16-31)
+        for (uint8_t i = SLOTS_PER_SECTOR; i < TOTAL_SLOT_COUNT; i++) {
+            if (is_slot_empty(i)) {
+                return i;
+            }
+        }
+    } else {
+        // Search sector B first (slots 16-31)
+        for (uint8_t i = SLOTS_PER_SECTOR; i < TOTAL_SLOT_COUNT; i++) {
+            if (is_slot_empty(i)) {
+                return i;
+            }
+        }
+        // Sector B full - search sector A (slots 0-15)
+        for (uint8_t i = 0; i < SLOTS_PER_SECTOR; i++) {
+            if (is_slot_empty(i)) {
+                return i;
+            }
+        }
+    }
+
+    return -1;  // Both sectors full (shouldn't happen with proper erase logic)
+}
+
+// Get which sector a slot is in (0 = A, 1 = B)
+static uint8_t get_slot_sector(uint8_t slot_index)
+{
+    return (slot_index < SLOTS_PER_SECTOR) ? 0 : 1;
+}
+
+void flash_init(void)
+{
+    // Idempotent: safe to call from early detection paths AND later setup.
+    if (runtime_settings_loaded) return;
+
+    save_pending = false;
+
+    // Find current sequence number from flash (searches both sectors)
+    int newest = find_newest_slot();
+    if (newest >= 0) {
+        current_sequence = get_slot(newest)->sequence;
+        printf("[flash] Found newest slot %d (sector %c, seq=%lu)\n",
+               newest, (newest < SLOTS_PER_SECTOR) ? 'A' : 'B',
+               (unsigned long)current_sequence);
+    } else {
+        current_sequence = 0;
+        printf("[flash] No valid settings found, starting fresh\n");
+    }
+
+    // Load runtime settings
+    if (!flash_load(&runtime_settings)) {
+        // No valid settings - initialize defaults
+        memset(&runtime_settings, 0, sizeof(flash_t));
+        runtime_settings.magic = SETTINGS_MAGIC;
+        runtime_settings.sequence = 0;
+        runtime_settings.active_profile_index = 0;  // Default profile
+        runtime_settings.custom_profile_count = 0;
+        runtime_settings.schema_version = FLASH_SCHEMA_VERSION;
+    }
+    runtime_settings_loaded = true;
+}
+
+// Load settings from flash (returns true if valid settings found).
+// Enforces FLASH_SCHEMA_VERSION: a magic-OK record with mismatched
+// schema_version is treated as stale (likely a v1.9.0/v2.0.0 upgrade
+// where reserved bytes were reinterpreted as new fields). Returns false
+// so the caller falls back to defaults; current_sequence is still
+// advanced past the stale record so the next write supersedes it.
+bool flash_load(flash_t* settings)
+{
+    int newest = find_newest_slot();
+
+    if (newest < 0) {
+        return false;  // No valid settings in flash
+    }
+
+    const flash_t* slot = get_slot(newest);
+    if (slot->schema_version != FLASH_SCHEMA_VERSION) {
+        printf("[flash] schema mismatch (stored=v%u, expected=v%u) — wiping settings\n",
+               (unsigned)slot->schema_version, (unsigned)FLASH_SCHEMA_VERSION);
+        // Advance past the stale record so the migrated defaults win when
+        // the app saves next. The actual sectors stay intact until then —
+        // higher sequence number ensures the new record is preferred.
+        current_sequence = slot->sequence;
+        return false;
+    }
+
+    // Copy settings from flash to RAM
+    memcpy(settings, slot, sizeof(flash_t));
+    current_sequence = slot->sequence;
+
+    unsigned fixed = flash_sanitize_record(settings);
+    if (fixed) {
+        printf("[flash] %u incoherent field(s) in stored record reset to defaults\n", fixed);
+    }
+
+    return true;
+}
+
+// Save settings to flash (debounced - actual write happens after delay)
+void flash_save(const flash_t* settings)
+{
+    // Store settings and mark as pending
+    memcpy(&pending_settings, settings, sizeof(flash_t));
+    pending_settings.magic = SETTINGS_MAGIC;
+    pending_settings.schema_version = FLASH_SCHEMA_VERSION;
+    save_pending = true;
+    last_change_time = get_absolute_time();
+}
+
+// Page program worker - only programs one page, no erase (~1ms)
+// This is safe during BT as it only takes ~1ms
+typedef struct {
+    uint32_t offset;
+    const uint8_t* data;
+} page_program_params_t;
+
+static void __no_inline_not_in_flash_func(page_program_worker)(void* param)
+{
+    page_program_params_t* p = (page_program_params_t*)param;
+    flash_range_program(p->offset, p->data, FLASH_PAGE_SIZE);
+}
+
+// Sector erase worker - erases entire sector (~45ms)
+// With dual-sector design, we always erase the inactive sector, so this is safe
+typedef struct {
+    uint32_t offset;
+} sector_erase_params_t;
+
+static void __no_inline_not_in_flash_func(sector_erase_worker)(void* param)
+{
+    sector_erase_params_t* p = (sector_erase_params_t*)param;
+    flash_range_erase(p->offset, FLASH_SECTOR_SIZE);
+}
+
+// Write a single page to flash (BT-safe, ~1ms)
+static bool flash_write_page(uint8_t slot_index, const flash_t* settings)
+{
+    static flash_t write_buffer;  // Static to persist during flash ops
+    memcpy(&write_buffer, settings, sizeof(flash_t));
+
+    uint32_t offset = get_slot_offset(slot_index);
+
+    page_program_params_t params = {
+        .offset = offset,
+        .data = (const uint8_t*)&write_buffer
+    };
+
+    // Try flash_safe_execute first
+    int result = flash_safe_execute(page_program_worker, &params, UINT32_MAX);
+
+    if (result != PICO_OK) {
+        // Fallback: direct write with interrupts disabled briefly
+        uint32_t ints = save_and_disable_interrupts();
+        flash_range_program(offset, (const uint8_t*)&write_buffer, FLASH_PAGE_SIZE);
+        restore_interrupts(ints);
+    }
+
+    return true;
+}
+
+// Erase a specific sector (0 = A, 1 = B)
+// Safe to call anytime - we only erase the sector without valid data
+static void flash_erase_sector(uint8_t sector)
+{
+    uint32_t offset = (sector == 0) ? FLASH_SECTOR_A_OFFSET : FLASH_SECTOR_B_OFFSET;
+    printf("[flash] Erasing sector %c at offset 0x%lX...\n",
+           (sector == 0) ? 'A' : 'B', (unsigned long)offset);
+    flush_output();
+
+    sector_erase_params_t params = { .offset = offset };
+
+    // Try flash_safe_execute first
+    int result = flash_safe_execute(sector_erase_worker, &params, UINT32_MAX);
+
+    if (result != PICO_OK) {
+        printf("[flash] flash_safe_execute failed (%d), trying direct erase...\n", result);
+        flush_output();
+
+        uint32_t ints = save_and_disable_interrupts();
+        flash_range_erase(offset, FLASH_SECTOR_SIZE);
+        restore_interrupts(ints);
+    }
+
+    printf("[flash] Sector erase complete\n");
+}
+
+// Force immediate save (bypasses debouncing)
+// With dual-sector design, this is always safe - we erase the OTHER sector
+// Diagnostic: total committed flash writes since boot. A steadily climbing
+// count while idle means something is persisting settings in a hot path.
+volatile uint32_t g_flash_write_count = 0;
+uint32_t flash_get_write_count(void) { return g_flash_write_count; }
+
+void flash_save_now(const flash_t* settings)
+{
+    g_flash_write_count++;
+    static flash_t write_settings;
+    memcpy(&write_settings, settings, sizeof(flash_t));
+    write_settings.magic = SETTINGS_MAGIC;
+    write_settings.schema_version = FLASH_SCHEMA_VERSION;
+    write_settings.sequence = ++current_sequence;
+
+    // Find next empty slot
+    int slot = find_empty_slot();
+
+    if (slot < 0) {
+        // Both sectors full - find newest slot and erase the OTHER sector
+        int newest = find_newest_slot();
+        uint8_t newest_sector = (newest >= 0) ? get_slot_sector(newest) : 0;
+        uint8_t erase_sector = (newest_sector == 0) ? 1 : 0;
+
+        printf("[flash] Both sectors full, erasing sector %c\n",
+               (erase_sector == 0) ? 'A' : 'B');
+        flash_erase_sector(erase_sector);
+
+        // Write to first slot of erased sector
+        slot = (erase_sector == 0) ? 0 : SLOTS_PER_SECTOR;
+    }
+
+    printf("[flash] Writing to slot %d (seq=%lu) at offset 0x%lX\n",
+           slot, (unsigned long)write_settings.sequence,
+           (unsigned long)get_slot_offset(slot));
+
+    flash_write_page(slot, &write_settings);
+
+    // Verify the write
+    const flash_t* verify = get_slot(slot);
+    printf("[flash] Verify: magic=0x%08lX, seq=%lu, profile=%d, usb_mode=%d, orient=%d\n",
+           (unsigned long)verify->magic, (unsigned long)verify->sequence,
+           verify->active_profile_index, verify->usb_output_mode,
+           verify->orient_mode);
+
+    save_pending = false;
+}
+
+// Force immediate save - same as flash_save_now() with dual-sector design
+// Kept for API compatibility
+void flash_save_force(const flash_t* settings)
+{
+    flash_save_now(settings);
+}
+
+void flash_factory_reset(void)
+{
+    // Erase the settings sector
+    flash_t empty = {0};
+    flash_save_now(&empty);
+    printf("[flash] Factory reset — settings erased\n");
+}
+
+// Task function to handle debounced flash writes (call from main loop)
+void flash_task(void)
+{
+    if (!save_pending) {
+        return;
+    }
+
+    // Check if debounce time has elapsed
+    int64_t time_since_change = absolute_time_diff_us(last_change_time, get_absolute_time());
+    if (time_since_change >= (SAVE_DEBOUNCE_MS * 1000)) {
+        flash_save_now(&pending_settings);
+    }
+}
+
+// Called when BT disconnects - kept for API compatibility
+// With dual-sector design, no deferred erases needed
+void flash_on_bt_disconnect(void)
+{
+    // No-op with dual-sector design
+}
+
+// Check if there's a pending write waiting
+bool flash_has_pending_write(void)
+{
+    return save_pending;
+}
+
+// ============================================================================
+// Custom Profile Helpers
+// ============================================================================
+
+// Initialize a custom profile to default values (passthrough)
+void custom_profile_init(custom_profile_t* profile, const char* name)
+{
+    if (!profile) return;
+
+    memset(profile, 0, sizeof(custom_profile_t));
+
+    // Copy name (null-terminated)
+    if (name) {
+        strncpy(profile->name, name, CUSTOM_PROFILE_NAME_LEN - 1);
+        profile->name[CUSTOM_PROFILE_NAME_LEN - 1] = '\0';
+    }
+
+    // All buttons passthrough (0x00)
+    memset(profile->button_map, BUTTON_MAP_PASSTHROUGH, CUSTOM_PROFILE_BUTTON_COUNT);
+
+    // Default sensitivities (100 = 1.0x)
+    profile->left_stick_sens = 100;
+    profile->right_stick_sens = 100;
+
+    // No flags set
+    profile->flags = 0;
+}
+
+// Apply button mapping from custom profile
+// Returns remapped buttons, or original if profile is NULL
+uint32_t custom_profile_apply_buttons(const custom_profile_t* profile, uint32_t buttons)
+{
+    if (!profile) return buttons;
+
+    uint32_t output = 0;
+
+    for (int i = 0; i < CUSTOM_PROFILE_BUTTON_COUNT; i++) {
+        // Check if this input button is pressed
+        if (buttons & (1u << i)) {
+            uint8_t mapping = profile->button_map[i];
+
+            if (mapping == BUTTON_MAP_PASSTHROUGH) {
+                // Keep original button
+                output |= (1u << i);
+            } else if (mapping == BUTTON_MAP_DISABLED) {
+                // Button disabled, don't output anything
+            } else if (mapping >= 1 && mapping <= BUTTON_MAP_MAX_TARGET) {
+                // Remap to different button (1-based index)
+                output |= (1u << (mapping - 1));
+            }
+        }
+    }
+
+    // Pass through buttons beyond the profile map (A3, A4, L4, R4, F1, F2, L5, R5)
+    output |= buttons & ~((1u << CUSTOM_PROFILE_BUTTON_COUNT) - 1);
+
+    return output;
+}
+
+// Get custom profile by index (0-3), returns NULL if index >= count
+const custom_profile_t* flash_get_custom_profile(const flash_t* settings, uint8_t index)
+{
+    if (!settings) return NULL;
+    if (index >= settings->custom_profile_count) return NULL;
+    if (index >= CUSTOM_PROFILE_MAX_COUNT) return NULL;
+
+    return &settings->profiles[index];
+}
+
+// ============================================================================
+// Custom Profile Runtime API
+// ============================================================================
+
+// Get the currently loaded flash settings (for runtime access)
+flash_t* flash_get_settings(void)
+{
+    if (!runtime_settings_loaded) {
+        return NULL;
+    }
+    return &runtime_settings;
+}
+
+// Get active custom profile index (0=Default/passthrough, 1-4=custom profiles).
+// Returns the effective current index: PROFILE.SELECT override if set, else
+// the persisted runtime_settings value. PROFILE.APPLY does NOT change this
+// (it overrides the button_map, not the indexed selection).
+uint8_t flash_get_active_profile_index(void)
+{
+    if (!runtime_settings_loaded) {
+        return 0;
+    }
+    if (ephemeral_active_idx >= 0) {
+        return (uint8_t)ephemeral_active_idx;
+    }
+    return runtime_settings.active_profile_index;
+}
+
+// Persist the system-wide D-pad mode and mark it as explicitly saved.
+// Idempotent — skips the write if value + saved-flag already match.
+void flash_set_dpad_mode(uint8_t mode)
+{
+    // Mode 3 (LSTICK<->RSTICK) was added alongside the 4-position d-pad slider
+    // hotkey; this guard still said 2 and silently dropped it, so the slider's
+    // rightmost position never survived a reboot. The bound is shared with
+    // flash_sanitize_record() — raising one without the other is what let the
+    // load side keep reverting what the write side had just fixed.
+    if (mode > FLASH_DPAD_MODE_MAX) return;
+    if (!runtime_settings_loaded) {
+        flash_t tmp;
+        if (!flash_load(&tmp)) memset(&tmp, 0, sizeof(tmp));
+        tmp.dpad_mode = mode;
+        tmp.router_saved = 1;
+        flash_save(&tmp);
+        return;
+    }
+    if (runtime_settings.dpad_mode == mode && runtime_settings.router_saved) {
+        return;
+    }
+    runtime_settings.dpad_mode = mode;
+    runtime_settings.router_saved = 1;
+    flash_save(&runtime_settings);
+}
+
+// Persist the shoulder-swap toggle (L1<->L2, R1<->R2). Idempotent.
+void flash_set_shoulder_swap(uint8_t on)
+{
+    on = on ? 1 : 0;
+    if (!runtime_settings_loaded) {
+        flash_t tmp;
+        if (!flash_load(&tmp)) memset(&tmp, 0, sizeof(tmp));
+        tmp.shoulder_swap = on;
+        tmp.router_saved = 1;
+        flash_save(&tmp);
+        return;
+    }
+    if (runtime_settings.shoulder_swap == on && runtime_settings.router_saved) {
+        return;
+    }
+    runtime_settings.shoulder_swap = on;
+    runtime_settings.router_saved = 1;
+    flash_save(&runtime_settings);
+}
+
+uint8_t flash_get_builtin_disabled_mask(void)
+{
+    if (!runtime_settings_loaded) return 0;
+    return runtime_settings.builtin_disabled_mask;
+}
+
+void flash_set_builtin_disabled_mask(uint8_t mask)
+{
+    if (!runtime_settings_loaded) {
+        flash_t tmp;
+        if (!flash_load(&tmp)) memset(&tmp, 0, sizeof(tmp));
+        tmp.builtin_disabled_mask = mask;
+        flash_save(&tmp);
+        return;
+    }
+    if (runtime_settings.builtin_disabled_mask == mask) return;
+    runtime_settings.builtin_disabled_mask = mask;
+    flash_save(&runtime_settings);
+}
+
+// Set active custom profile index (saves to flash with debouncing).
+// Persistent — clears any ephemeral override (APPLY + SELECT) so the
+// persisted value is what the device boots to.
+void flash_set_active_profile_index(uint8_t index)
+{
+    // Explicit persistent selection trumps both ephemeral overrides.
+    ephemeral_active = false;
+    ephemeral_active_idx = -1;
+
+    if (!runtime_settings_loaded) {
+        return;
+    }
+
+    // Validate index (0=default, 1-N=custom profiles)
+    uint8_t max_index = runtime_settings.custom_profile_count;
+    if (index > max_index) {
+        index = max_index;
+    }
+
+    if (runtime_settings.active_profile_index != index) {
+        runtime_settings.active_profile_index = index;
+        // Immediate commit (no debouncing). PROFILE.SET is now the rare
+        // "deliberate config change" path — hot-loop switching goes via
+        // PROFILE.SELECT — so we want this to land before the next command
+        // or reboot, not 5s later.
+        flash_save_now(&runtime_settings);
+        printf("[flash] Active profile set to %d (persisted)\n", index);
+    }
+}
+
+// Deferred variant — same memory + ephemeral effect as
+// flash_set_active_profile_index, but uses the debounced flash_save
+// instead of flash_save_now so it's safe to call from hot paths like the
+// SELECT+D-pad cycle hotkey. The persist lands ~5 s after the last call,
+// which is fine because:
+//   - On normal use the cycle stops within a second or two, then the
+//     debounce fires and writes once;
+//   - If the user power-cycles before the debounce fires they just
+//     boot back into the previously-persisted profile, which is the
+//     same recovery semantics as any debounced setting.
+void flash_set_active_profile_index_deferred(uint8_t index)
+{
+    ephemeral_active = false;
+    ephemeral_active_idx = -1;
+
+    if (!runtime_settings_loaded) {
+        return;
+    }
+
+    uint8_t max_index = runtime_settings.custom_profile_count;
+    if (index > max_index) {
+        index = max_index;
+    }
+
+    if (runtime_settings.active_profile_index != index) {
+        runtime_settings.active_profile_index = index;
+        flash_save(&runtime_settings);   // debounced — non-blocking
+        printf("[flash] Active profile set to %d (deferred)\n", index);
+    }
+}
+
+// Ephemeral variant: update a RAM-only sidecar, do not write to flash and
+// do NOT mutate runtime_settings.active_profile_index (any later flash_save
+// from another setting would otherwise persist the ephemeral value). The
+// persistent boot default is untouched — after reboot, whatever was last
+// persisted via flash_set_active_profile_index comes back.
+void flash_select_active_profile_index(uint8_t index)
+{
+    // PROFILE.APPLY override (button_map) is cleared by explicit selection.
+    ephemeral_active = false;
+
+    if (!runtime_settings_loaded) {
+        return;
+    }
+    uint8_t max_index = runtime_settings.custom_profile_count;
+    if (index > max_index) {
+        index = max_index;
+    }
+    ephemeral_active_idx = (int8_t)index;
+    printf("[flash] Active profile selected to %d (RAM only)\n", index);
+}
+
+// Get total profile count (1 default + custom_profile_count)
+uint8_t flash_get_total_profile_count(void)
+{
+    if (!runtime_settings_loaded) {
+        return 1;  // At least the default profile
+    }
+    return 1 + runtime_settings.custom_profile_count;
+}
+
+// Get active custom profile (returns NULL for index 0/default or if invalid).
+// Precedence: (1) PROFILE.APPLY button_map override, (2) PROFILE.SELECT index
+// override (RAM only), (3) persisted runtime_settings.active_profile_index.
+const custom_profile_t* flash_get_active_custom_profile(void)
+{
+    // 1. PROFILE.APPLY ephemeral button_map wins — RAM only, not persisted.
+    if (ephemeral_active) {
+        return &ephemeral_profile;
+    }
+
+    if (!runtime_settings_loaded) {
+        return NULL;
+    }
+
+    // 2. PROFILE.SELECT ephemeral index, else 3. persisted value.
+    uint8_t index = (ephemeral_active_idx >= 0)
+                    ? (uint8_t)ephemeral_active_idx
+                    : runtime_settings.active_profile_index;
+    if (index == 0) {
+        return NULL;  // Default profile (passthrough)
+    }
+    return flash_get_custom_profile(&runtime_settings, index - 1);
+}
+
+// ----------------------------------------------------------------------------
+// Ephemeral Runtime Profile Override (PROFILE.APPLY) — see flash.h
+// ----------------------------------------------------------------------------
+
+void flash_apply_ephemeral_profile(const custom_profile_t* cp)
+{
+    if (!cp) {
+        ephemeral_active = false;
+        return;
+    }
+    ephemeral_profile = *cp;
+    ephemeral_active = true;
+}
+
+void flash_clear_ephemeral_profile(void)
+{
+    ephemeral_active = false;
+}
+
+bool flash_has_ephemeral_profile(void)
+{
+    return ephemeral_active;
+}
+
+// ----------------------------------------------------------------------------
+// Runtime Overlay (OVERLAY.SET / OVERLAY.CLEAR) — see flash.h
+// ----------------------------------------------------------------------------
+
+void flash_set_overlay(const runtime_overlay_t* o)
+{
+    if (!o) {
+        overlay_active_flag = false;
+        return;
+    }
+    overlay_slot = *o;
+    overlay_active_flag = true;
+}
+
+void flash_clear_overlay(void)
+{
+    overlay_active_flag = false;
+}
+
+const runtime_overlay_t* flash_get_overlay(void)
+{
+    return overlay_active_flag ? &overlay_slot : NULL;
+}
+
+// Cycle to next profile (wraps around)
+void flash_cycle_profile_next(void)
+{
+    if (!runtime_settings_loaded) {
+        return;
+    }
+
+    uint8_t total = flash_get_total_profile_count();
+    if (total <= 1) {
+        return;  // No custom profiles to cycle
+    }
+
+    uint8_t current = runtime_settings.active_profile_index;
+    uint8_t next = (current + 1) % total;
+    flash_set_active_profile_index(next);
+}
+
+// Cycle to previous profile (wraps around)
+void flash_cycle_profile_prev(void)
+{
+    if (!runtime_settings_loaded) {
+        return;
+    }
+
+    uint8_t total = flash_get_total_profile_count();
+    if (total <= 1) {
+        return;  // No custom profiles to cycle
+    }
+
+    uint8_t current = runtime_settings.active_profile_index;
+    uint8_t prev = (current == 0) ? (total - 1) : (current - 1);
+    flash_set_active_profile_index(prev);
+}

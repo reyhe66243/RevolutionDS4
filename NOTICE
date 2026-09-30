@@ -1,0 +1,31 @@
+REVOLUTIONDS4 - DualShock 4 to Wii bridge
+Copyright (c) 2026 Reyhe66243
+
+This project exists thanks to, and derives work from, the following projects:
+
+  Dolphin Emulator Project
+    Used as documentation and reference to understand the remote
+    authentication and the protocol. No code from it is used in this project;
+    the implementation in wiimote_crypto.c was written for REVOLUTIONDS4.
+
+  Fakemote
+    Source of the console side of the project: the emulated remote, the
+    MotionPlus emulation and the input handling were derived from it and have
+    been extensively modified. Licensed under the GNU General Public License
+    version 2.
+
+  Joypad OS
+    Source of the input routing, player management and feedback services used
+    by the adapter firmware. Licensed under the Apache License 2.0.
+
+DualShock 4 and Wii are trademarks of Sony Interactive Entertainment Inc. and
+Nintendo Co., Ltd. This project is not affiliated with, endorsed by or
+sponsored by either company.
+
+Third party components linked into the adapter firmware binary:
+
+  RP2040 SDK        BSD-3-Clause
+  TinyUSB           MIT
+  BTstack           BTstack License (permissive)
+
+Their license terms must accompany any distribution of the compiled firmware.

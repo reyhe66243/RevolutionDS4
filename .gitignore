@@ -1,0 +1,13 @@
+# Build outputs and compiled artifacts are not tracked: they belong to
+# releases and stay on the developer's machine.
+build/
+cios/build/
+firmware/build/
+REVOLUTIONDS4.app
+REVOLUTIONDS4.uf2
+
+# Editor and OS leftovers
+*.bak
+*.orig
+*~
+.DS_Store

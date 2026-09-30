@@ -1,0 +1,14 @@
+REVOLUTIONDS4 is licensed per component, because it derives from work under
+different licenses:
+
+  cios/       GNU General Public License, version 2
+              (derived from Fakemote, which is GPL-2.0; see
+              cios/LICENSE and the NOTICE file)
+
+  firmware/   Apache License, Version 2.0
+              (derived from Joypad OS, which is Apache-2.0; see
+              firmware/LICENSE)
+
+Each distribution must carry the license of the component it contains, together
+with the copyright notices and the NOTICE file. The documentation at the root
+and in docs/ is covered by the same terms as the component it documents.
