@@ -194,8 +194,11 @@ int add_player(int dev_addr, int instance, input_transport_t transport, const ch
     players[player_index].name[0] = '\0';
   }
 
-  // Set default LED color for this player slot
-  feedback_set_led_player(player_index, player_index + 1);
+  // Set default LED color for this player slot if host hasn't provided RGB
+  feedback_state_t* fb = feedback_get_state(player_index);
+  if (!fb || !fb->led.has_rgb) {
+    feedback_set_led_player(player_index, player_index + 1);
+  }
 
   // Send CDC connect event for web config
 #if CFG_TUD_CDC > 0

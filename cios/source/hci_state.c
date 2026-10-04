@@ -44,10 +44,8 @@ u16 hci_con_handle_virt_alloc(void)
 
 bool hci_can_request_connection(void)
 {
-    /* If page scan is disabled the controller will not see connection requests. */
-    if (!(hci_page_scan_enable & HCI_PAGE_SCAN_ENABLE))
-        return false;
-
+    /* Emulated Wiimotes connect directly via Starlet IPC events,
+     * so do not gate connection requests on physical radio page scan. */
     return true;
 }
 

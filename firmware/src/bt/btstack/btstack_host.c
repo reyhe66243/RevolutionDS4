@@ -1995,16 +1995,12 @@ static void hid_host_packet_handler(uint8_t packet_type, uint16_t channel, uint8
             // Accept incoming HID connections from devices
             uint16_t hid_cid = hid_subevent_incoming_connection_get_hid_cid(packet);
 
-            // Determine protocol mode from device profile (if name is available)
-            hid_protocol_mode_t accept_mode = HID_PROTOCOL_MODE_REPORT_WITH_FALLBACK_TO_BOOT;
-            if (classic_state.pending_valid && classic_state.pending_name[0]) {
-                const bt_device_profile_t* profile = bt_device_lookup_by_name(classic_state.pending_name);
-                if (profile->hid_mode == BT_HID_MODE_REPORT) {
-                    accept_mode = HID_PROTOCOL_MODE_REPORT;
-                }
-            }
-            printf("[BTSTACK_HOST] HID incoming connection, cid=0x%04X - accepting (mode=%s)\n",
-                   hid_cid, accept_mode == HID_PROTOCOL_MODE_REPORT ? "REPORT" : "FALLBACK");
+            // In RevolutionDS4, all incoming connections are DualShock 4 controllers.
+            // Accepting with HID_PROTOCOL_MODE_BOOT instructs BTstack hid_host to skip
+            // the SDP descriptor query, preventing CYW43 baseband stalls and eliminating
+            // the white lightbar hang on cold boot / fresh flash.
+            hid_protocol_mode_t accept_mode = HID_PROTOCOL_MODE_BOOT;
+            printf("[BTSTACK_HOST] HID incoming connection, cid=0x%04X - accepting (mode=BOOT/skip SDP)\n", hid_cid);
             hid_host_accept_connection(hid_cid, accept_mode);
 
             // Allocate connection slot if needed
@@ -2107,12 +2103,19 @@ static void hid_host_packet_handler(uint8_t packet_type, uint16_t channel, uint8
                 if (conn->name[0] && !conn->profile) {
                     conn->profile = bt_device_lookup_by_name(conn->name);
                 }
+                if (!conn->profile) {
+                    conn->profile = &BT_PROFILE_SONY;
+                }
 
-                // Set default VID/PID from profile if available
-                if (conn->vendor_id == 0 && conn->profile && conn->profile->default_vid) {
-                    conn->vendor_id = conn->profile->default_vid;
+                // In RevolutionDS4, ensure Sony VID/PID and name are always set
+                if (conn->vendor_id == 0) {
+                    conn->vendor_id = conn->profile->default_vid ? conn->profile->default_vid : 0x054C;
+                    conn->product_id = conn->profile->default_pid ? conn->profile->default_pid : 0x05C4;
                     printf("[BTSTACK_HOST] Set VID=0x%04X from %s profile\n",
                            conn->vendor_id, conn->profile->name);
+                }
+                if (conn->name[0] == '\0') {
+                    strncpy(conn->name, "Wireless Controller", sizeof(conn->name) - 1);
                 }
 
                 // Wait for HID_SUBEVENT_DESCRIPTOR_AVAILABLE

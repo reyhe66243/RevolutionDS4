@@ -9,10 +9,12 @@
 #include <string.h>
 
 const bt_device_profile_t BT_PROFILE_DEFAULT = {
-    .name = "Generic",
+    .name = "DualShock 4",
     .classic = BT_CLASSIC_HID_HOST,
     .hid_mode = BT_HID_MODE_REPORT,
     .pin_type = BT_PIN_NONE,
+    .default_vid = 0x054C,
+    .default_pid = 0x05C4,
 };
 
 const bt_device_profile_t BT_PROFILE_SONY = {
@@ -21,6 +23,7 @@ const bt_device_profile_t BT_PROFILE_SONY = {
     .hid_mode = BT_HID_MODE_REPORT,
     .pin_type = BT_PIN_NONE,
     .default_vid = 0x054C,
+    .default_pid = 0x05C4,
 };
 
 typedef struct {

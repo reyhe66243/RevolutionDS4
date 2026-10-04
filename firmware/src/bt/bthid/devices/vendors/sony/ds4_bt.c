@@ -921,12 +921,18 @@ static void ds4_task(bthid_device_t* device)
             if (now - ds4->activation_time >= 100) {
                 int player_idx = find_player_index(ds4->event.dev_addr, ds4->event.instance);
                 int color_idx = (player_idx >= 0) ? (player_idx % 4) : 0;
+                uint8_t init_r = PLAYER_COLORS[color_idx][0];
+                uint8_t init_g = PLAYER_COLORS[color_idx][1];
+                uint8_t init_b = PLAYER_COLORS[color_idx][2];
+                feedback_state_t* fb = (player_idx >= 0) ? feedback_get_state(player_idx) : NULL;
+                if (fb && fb->led.has_rgb && (fb->led.r != 0 || fb->led.g != 0 || fb->led.b != 0)) {
+                    init_r = fb->led.r;
+                    init_g = fb->led.g;
+                    init_b = fb->led.b;
+                }
                 // First SET_REPORT Output triggers DS4 to switch from basic (0x01)
                 // to enhanced (0x11) report mode with motion/touchpad data.
-                if (ds4_send_output(device, 0, 0,
-                                    PLAYER_COLORS[color_idx][0],
-                                    PLAYER_COLORS[color_idx][1],
-                                    PLAYER_COLORS[color_idx][2])) {
+                if (ds4_send_output(device, 0, 0, init_r, init_g, init_b)) {
                     ds4->activation_time = now;
                     ds4->activation_state = 2;
                 } else {
@@ -946,10 +952,16 @@ static void ds4_task(bthid_device_t* device)
                 if (!ds4->sixaxis_enabled && (now - ds4->activation_time >= 200)) {
                     ds4->activation_time = now;
                     int color_idx = player_idx % 4;
-                    ds4_send_output(device, 0, 0,
-                                    PLAYER_COLORS[color_idx][0],
-                                    PLAYER_COLORS[color_idx][1],
-                                    PLAYER_COLORS[color_idx][2]);
+                    uint8_t act_r = PLAYER_COLORS[color_idx][0];
+                    uint8_t act_g = PLAYER_COLORS[color_idx][1];
+                    uint8_t act_b = PLAYER_COLORS[color_idx][2];
+                    feedback_state_t* fb_init = feedback_get_state(player_idx);
+                    if (fb_init && fb_init->led.has_rgb && (fb_init->led.r != 0 || fb_init->led.g != 0 || fb_init->led.b != 0)) {
+                        act_r = fb_init->led.r;
+                        act_g = fb_init->led.g;
+                        act_b = fb_init->led.b;
+                    }
+                    ds4_send_output(device, 0, 0, act_r, act_g, act_b);
                 }
 
                 // Factory calibration (feature report 0x05). First attempts go
@@ -1039,10 +1051,16 @@ static void ds4_task(bthid_device_t* device)
                     uint32_t elapsed = now - ds4->calib_led_start_ms;
                     if (elapsed >= (uint32_t)blinks * 600u) {
                         ds4->calib_led_result = 0;
-                        int color_idx = player_idx % 4;
-                        r = PLAYER_COLORS[color_idx][0];
-                        g = PLAYER_COLORS[color_idx][1];
-                        b = PLAYER_COLORS[color_idx][2];
+                        if (fb && fb->led.has_rgb && (fb->led.r != 0 || fb->led.g != 0 || fb->led.b != 0)) {
+                            r = fb->led.r;
+                            g = fb->led.g;
+                            b = fb->led.b;
+                        } else {
+                            int color_idx = player_idx % 4;
+                            r = PLAYER_COLORS[color_idx][0];
+                            g = PLAYER_COLORS[color_idx][1];
+                            b = PLAYER_COLORS[color_idx][2];
+                        }
                     } else if (((elapsed / 300u) & 1u) == 0) {
                         if (ds4->calib_led_result == 1)      { r = 0;   g = 255; b = 0; }
                         else if (ds4->calib_led_result == 2) { r = 255; g = 0;   b = 0; }

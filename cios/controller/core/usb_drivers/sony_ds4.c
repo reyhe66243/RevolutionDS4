@@ -121,6 +121,7 @@ struct ds4_private_data_t {
     u8 input_stuck_ticks;
     u8 led_rumble_stuck_ticks;
     u8 assigned_color_idx;
+    u8 reassert_led_ticks;
 };
 static_assert(sizeof(struct ds4_private_data_t) <= EGC_INPUT_DEVICE_PRIVATE_DATA_SIZE);
 
@@ -128,6 +129,16 @@ extern void ogc_ds4_attach_player2(egc_input_device_t *p1_dev);
 extern void ogc_ds4_detach_player2(egc_input_device_t *p2_dev);
 extern void input_device_set_connected(egc_input_device_t *device, bool connected);
 extern bool input_device_is_connected(egc_input_device_t *device);
+extern int hci_state_get_active_real_wiimote_count(void);
+
+static const u8 s_led_colors[4][3] = {
+    {0, 0, 1}, /* Player 1: Blue */
+    {1, 0, 0}, /* Player 2: Red */
+    {0, 1, 0}, /* Player 3: Green */
+    {1, 1, 0}, /* Player 4: Yellow (Nintendo Wii standard) */
+};
+
+static int ds4_driver_update_leds_rumble(egc_input_device_t *device);
 
 static egc_input_device_t *s_ds4_p1_device = NULL;
 static egc_input_device_t *s_ds4_p2_device = NULL;
@@ -296,7 +307,22 @@ static void ds4_request_data_cb(egc_usb_transfer_t *transfer)
             ds4_request_data(s_ds4_p1_device ? s_ds4_p1_device : device);
             return;
         }
+
+        bool was_connected = input_device_is_connected(target_dev);
         input_device_set_connected(target_dev, true);
+        if (!was_connected) {
+            struct ds4_private_data_t *target_priv = (void *)target_dev->private_data;
+            if (target_priv) {
+                int real_wiimotes = hci_state_get_active_real_wiimote_count();
+                u8 slot = (real_wiimotes + target_priv->player_index) & 3;
+                target_priv->assigned_color_idx = slot;
+                target_priv->led_color[0] = s_led_colors[slot][0] * 255;
+                target_priv->led_color[1] = s_led_colors[slot][1] * 255;
+                target_priv->led_color[2] = s_led_colors[slot][2] * 255;
+                target_priv->reassert_led_ticks = 250;
+                ds4_driver_update_leds_rumble(target_dev);
+            }
+        }
 
         u32 buttons = ds4_get_buttons(report);
         state.gamepad.buttons =
@@ -378,7 +404,6 @@ static inline int ds4_request_data(egc_input_device_t *device)
  * pool was exhausted, input polling failed permanently (all inputs were lost
  * while the game kept running). The backend now reclaims stale transfers by
  * age; this callback re-enables LED/rumble submissions when one completes. */
-static int ds4_driver_update_leds_rumble(egc_input_device_t *device);
 
 static void ds4_led_rumble_cb(egc_usb_transfer_t *transfer)
 {
@@ -718,24 +743,26 @@ int ds4_driver_ops_init(egc_input_device_t *device, u16 vid, u16 pid)
     /* Init private state */
     memset(priv, 0, sizeof(*priv));
 
+    int real_wiimotes = hci_state_get_active_real_wiimote_count();
     if (!s_ds4_p1_device || s_ds4_p1_device == device) {
         s_ds4_p1_device = device;
         s_ds4_p1_last_seen_ticks = s_ds4_ticks;
         priv->player_index = 0;
-        priv->assigned_color_idx = 0;
-        priv->led_color[0] = 0;
-        priv->led_color[1] = 0;
-        priv->led_color[2] = 255; /* Default: Player 1 Blue */
+        priv->assigned_color_idx = (real_wiimotes + 0) & 3;
+        priv->led_color[0] = s_led_colors[priv->assigned_color_idx][0] * 255;
+        priv->led_color[1] = s_led_colors[priv->assigned_color_idx][1] * 255;
+        priv->led_color[2] = s_led_colors[priv->assigned_color_idx][2] * 255;
     } else {
         s_ds4_p2_device = device;
         s_ds4_p2_attaching = false;
         priv->player_index = 1;
-        priv->assigned_color_idx = 1;
-        priv->led_color[0] = 255; /* Default: Player 2 Red */
-        priv->led_color[1] = 0;
-        priv->led_color[2] = 0;
+        priv->assigned_color_idx = (real_wiimotes + 1) & 3;
+        priv->led_color[0] = s_led_colors[priv->assigned_color_idx][0] * 255;
+        priv->led_color[1] = s_led_colors[priv->assigned_color_idx][1] * 255;
+        priv->led_color[2] = s_led_colors[priv->assigned_color_idx][2] * 255;
     }
     priv->input_pending = false;
+    priv->reassert_led_ticks = 250;
 
     device->state.gamepad.touch_points[0].x = -1;
     device->state.gamepad.touch_points[1].x = -1;
@@ -780,12 +807,6 @@ int ds4_driver_ops_disconnect(egc_input_device_t *device)
     return 0;
 }
 
-static const u8 s_led_colors[4][3] = {
-    {0, 0, 1}, /* Player 1: Blue */
-    {1, 0, 0}, /* Player 2: Red */
-    {0, 1, 0}, /* Player 3: Green */
-    {1, 1, 0}, /* Player 4: Yellow (Nintendo Wii standard) */
-};
 
 int ds4_driver_ops_set_leds(egc_input_device_t *device, u32 leds)
 {
@@ -869,6 +890,24 @@ static bool ds4_driver_ops_timer(egc_input_device_t *device)
         } else if (priv->led_rumble_dirty) {
             priv->led_rumble_dirty = false;
             ds4_driver_update_leds_rumble(device);
+        }
+
+        /* Periodic LED color re-assert to override Pico W local calibration startup colors */
+        if (priv->reassert_led_ticks > 0) {
+            priv->reassert_led_ticks--;
+            if ((priv->reassert_led_ticks % 50) == 0) {
+                ds4_driver_update_leds_rumble(device);
+            }
+        }
+
+        if (s_ds4_p2_device && s_ds4_p2_device != device) {
+            struct ds4_private_data_t *p2_priv = (void *)s_ds4_p2_device->private_data;
+            if (p2_priv && p2_priv->reassert_led_ticks > 0) {
+                p2_priv->reassert_led_ticks--;
+                if ((p2_priv->reassert_led_ticks % 50) == 0) {
+                    ds4_driver_update_leds_rumble(s_ds4_p2_device);
+                }
+            }
         }
     }
 

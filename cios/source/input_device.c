@@ -214,10 +214,22 @@ void input_device_set_connected(egc_input_device_t *device, bool connected)
     if (!input_device)
         return;
 
+    bool was_connected = input_device->controller_connected;
     input_device->controller_connected = connected;
 
     if (connected) {
         input_device->reconnect_delay = 0;
+        if (!was_connected && input_device->assigned_wiimote) {
+            fake_wiimote_t *wiimote = input_device->assigned_wiimote;
+            int real_wiimotes = hci_state_get_active_real_wiimote_count();
+            int player_slot = real_wiimotes + wiimote->index;
+            if (player_slot >= 4)
+                player_slot = 3;
+            u32 led_val = (wiimote->status.leds & 0x0F) ? (wiimote->status.leds & 0x0F) : BIT(player_slot);
+            if (wiimote->is_wheel_mode)
+                led_val |= BIT(4);
+            input_device_set_leds(input_device, led_val);
+        }
     }
 }
 
