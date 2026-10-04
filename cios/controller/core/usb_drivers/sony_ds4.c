@@ -120,6 +120,7 @@ struct ds4_private_data_t {
     u8 player_index;
     u8 input_stuck_ticks;
     u8 led_rumble_stuck_ticks;
+    u8 assigned_color_idx;
 };
 static_assert(sizeof(struct ds4_private_data_t) <= EGC_INPUT_DEVICE_PRIVATE_DATA_SIZE);
 
@@ -399,7 +400,7 @@ static inline int ds4_set_leds_rumble(egc_input_device_t *device, u8 r, u8 g, u8
                                       u8 rumble_large)
 {
     struct ds4_private_data_t *priv = (void *)device->private_data;
-    u8 report_id = (priv && priv->player_index == 1) ? 0x06 : 0x05;
+    u8 report_id = (device == s_ds4_p2_device || (priv && priv->player_index == 1)) ? 0x06 : 0x05;
 
     u8 buf[32] = {
         report_id, // Report ID 5 (P1) or 6 (P2)
@@ -721,6 +722,7 @@ int ds4_driver_ops_init(egc_input_device_t *device, u16 vid, u16 pid)
         s_ds4_p1_device = device;
         s_ds4_p1_last_seen_ticks = s_ds4_ticks;
         priv->player_index = 0;
+        priv->assigned_color_idx = 0;
         priv->led_color[0] = 0;
         priv->led_color[1] = 0;
         priv->led_color[2] = 255; /* Default: Player 1 Blue */
@@ -728,6 +730,7 @@ int ds4_driver_ops_init(egc_input_device_t *device, u16 vid, u16 pid)
         s_ds4_p2_device = device;
         s_ds4_p2_attaching = false;
         priv->player_index = 1;
+        priv->assigned_color_idx = 1;
         priv->led_color[0] = 255; /* Default: Player 2 Red */
         priv->led_color[1] = 0;
         priv->led_color[2] = 0;
@@ -792,14 +795,14 @@ int ds4_driver_ops_set_leds(egc_input_device_t *device, u32 leds)
     u8 intensity = (leds & BIT(4)) ? 35 : 255;
     /* Default to the assigned player color so an active DS4 never turns dark
      * when a game or loader temporarily clears leds during transitions */
-    u8 p_idx = (priv->player_index < 4) ? priv->player_index : 0;
-    priv->led_color[0] = s_led_colors[p_idx][0] * intensity;
-    priv->led_color[1] = s_led_colors[p_idx][1] * intensity;
-    priv->led_color[2] = s_led_colors[p_idx][2] * intensity;
+    u8 c_idx = (priv->assigned_color_idx < 4) ? priv->assigned_color_idx : 0;
+    priv->led_color[0] = s_led_colors[c_idx][0] * intensity;
+    priv->led_color[1] = s_led_colors[c_idx][1] * intensity;
+    priv->led_color[2] = s_led_colors[c_idx][2] * intensity;
 
     for (int i = 0; i < 4; i++) {
         if (leds & BIT(i)) {
-            priv->player_index = i;
+            priv->assigned_color_idx = i;
             priv->led_color[0] = s_led_colors[i][0] * intensity;
             priv->led_color[1] = s_led_colors[i][1] * intensity;
             priv->led_color[2] = s_led_colors[i][2] * intensity;
