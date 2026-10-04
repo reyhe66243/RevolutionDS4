@@ -710,6 +710,8 @@ int ds4_driver_ops_init(egc_input_device_t *device, u16 vid, u16 pid)
     if (desc) {
         memcpy(desc, &s_device_description, sizeof(*desc));
         desc->product_id = pid;
+    } else {
+        device->desc = &s_device_description;
     }
 
     /* Init private state */
@@ -797,10 +799,11 @@ int ds4_driver_ops_set_leds(egc_input_device_t *device, u32 leds)
 
     for (int i = 0; i < 4; i++) {
         if (leds & BIT(i)) {
+            priv->player_index = i;
             priv->led_color[0] = s_led_colors[i][0] * intensity;
             priv->led_color[1] = s_led_colors[i][1] * intensity;
             priv->led_color[2] = s_led_colors[i][2] * intensity;
-            break;
+            return ds4_driver_update_leds_rumble(device);
         }
     }
 

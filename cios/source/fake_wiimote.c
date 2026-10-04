@@ -278,7 +278,11 @@ void fake_wiimote_init_state(fake_wiimote_t *wiimote, input_device_t *input_devi
     wiimote->hci_con_handle = 0;
     wiimote->num_completed_acl_data_packets = 0;
     wiimote->input_device = input_device;
-    wiimote->status.leds = BIT(wiimote->index);
+    int real_wiimotes = hci_state_get_active_real_wiimote_count();
+    int player_slot = real_wiimotes + wiimote->index;
+    if (player_slot >= 4)
+        player_slot = 3;
+    wiimote->status.leds = BIT(player_slot);
     wiimote->status.ir = 0;
     wiimote->status.speaker = 0;
     wiimote->buttons = 0;
@@ -421,7 +425,14 @@ void fake_wiimote_set_orientation_mode(fake_wiimote_t *wiimote, u8 mode)
     }
 
     if (wiimote->input_device) {
-        u32 led_val = wiimote->status.leds ? wiimote->status.leds : BIT(wiimote->index);
+        u32 led_val = wiimote->status.leds;
+        if (!led_val) {
+            int real_wiimotes = hci_state_get_active_real_wiimote_count();
+            int player_slot = real_wiimotes + wiimote->index;
+            if (player_slot >= 4)
+                player_slot = 3;
+            led_val = BIT(player_slot);
+        }
         if (wiimote->is_wheel_mode)
             led_val |= BIT(4);
         input_device_set_leds(wiimote->input_device, led_val);

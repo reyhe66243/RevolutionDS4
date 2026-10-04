@@ -4,6 +4,7 @@
 #include "button_map.h"
 #include "egc.h"
 #include "fake_wiimote.h"
+#include "hci_state.h"
 #include "types.h"
 #include "utils.h"
 #include "wiimote.h"
@@ -80,17 +81,6 @@ static const struct {
 	},
 };
 
-static const u8 ir_analog_axis_map[EGC_GAMEPAD_AXIS_COUNT] = {
-    [EGC_GAMEPAD_AXIS_RIGHTX] = BM_IR_AXIS_X,
-    [EGC_GAMEPAD_AXIS_RIGHTY] = BM_IR_AXIS_Y,
-};
-
-static const enum bm_ir_emulation_mode_e ir_emu_modes[] = {
-    BM_IR_EMULATION_MODE_DIRECT,
-    BM_IR_EMULATION_MODE_RELATIVE_ANALOG_AXIS,
-    BM_IR_EMULATION_MODE_ABSOLUTE_ANALOG_AXIS,
-};
-
 static struct input_device_t {
     egc_input_device_t *device;
     /* NULL if no assigned fake Wiimote */
@@ -98,23 +88,15 @@ static struct input_device_t {
     u32 reconnect_delay;
     u32 switch_mapping_combo;
     u32 switch_orientation_combo;
-    enum bm_ir_emulation_mode_e ir_emu_mode;
-    struct bm_ir_emulation_state_t ir_emu_state;
     u8 switch_mapping_hold_count;
     u8 switch_orientation_hold_count;
     u8 extension;
-    u8 ir_emu_mode_idx;
     u8 start_hold_count;
     u8 guide_hold_count;
     u8 back_hold_count;
     u8 guide_cooldown;
     bool controller_connected;
 } input_devices[MAX_INPUT_DEVS];
-
-static inline bool has_button(egc_input_device_t *device, egc_gamepad_button_e button)
-{
-    return device->desc->available_buttons & BIT(button);
-}
 
 static input_device_t *input_device_from_egc(egc_input_device_t *device)
 {
@@ -159,33 +141,17 @@ void input_device_handle_added(egc_input_device_t *device, void *userdata)
             input_devices[i].switch_orientation_hold_count = 0;
             input_devices[i].device->state.gamepad.touch_points[0].x = -1;
             input_devices[i].device->state.gamepad.touch_points[1].x = -1;
-            if (device->desc && device->desc->num_touch_points > 0) {
-                input_devices[i].ir_emu_mode_idx = 0; /* Direct touchpad mode */
-            } else {
-                input_devices[i].ir_emu_mode_idx = 1; /* Relative stick mode */
-            }
-            bm_ir_emulation_state_reset(&input_devices[i].ir_emu_state);
             input_devices[i].start_hold_count = 0;
             input_devices[i].guide_hold_count = 0;
             input_devices[i].back_hold_count = 0;
             input_devices[i].guide_cooldown = 0;
             input_devices[i].controller_connected = false;
 
-            if (has_button(device, EGC_GAMEPAD_BUTTON_LEFT_STICK) &&
-                has_button(device, EGC_GAMEPAD_BUTTON_LEFT_SHOULDER)) {
-                input_devices[i].switch_mapping_combo =
-                    BIT(EGC_GAMEPAD_BUTTON_LEFT_STICK) | BIT(EGC_GAMEPAD_BUTTON_LEFT_SHOULDER);
-            } else {
-                input_devices[i].switch_mapping_combo = 0;
-            }
-
-            if (has_button(device, EGC_GAMEPAD_BUTTON_RIGHT_STICK) &&
-                has_button(device, EGC_GAMEPAD_BUTTON_LEFT_SHOULDER)) {
-                input_devices[i].switch_orientation_combo =
-                    BIT(EGC_GAMEPAD_BUTTON_RIGHT_STICK) | BIT(EGC_GAMEPAD_BUTTON_LEFT_SHOULDER);
-            } else {
-                input_devices[i].switch_orientation_combo = 0;
-            }
+            /* RevolutionDS4 is strictly for DualShock 4: combos are always supported */
+            input_devices[i].switch_mapping_combo =
+                BIT(EGC_GAMEPAD_BUTTON_LEFT_STICK) | BIT(EGC_GAMEPAD_BUTTON_LEFT_SHOULDER);
+            input_devices[i].switch_orientation_combo =
+                BIT(EGC_GAMEPAD_BUTTON_RIGHT_STICK) | BIT(EGC_GAMEPAD_BUTTON_LEFT_SHOULDER);
             break;
         }
     }
@@ -295,7 +261,6 @@ bool input_device_report_input(input_device_t *input_device)
     union wiimote_extension_data_t extension_data;
     struct ir_dot_t ir_dots[IR_MAX_DOTS];
     bm_ir_dots_set_out_of_screen(ir_dots);
-    enum bm_ir_emulation_mode_e ir_emu_mode;
 
     /*
      * Combos:
@@ -333,7 +298,14 @@ bool input_device_report_input(input_device_t *input_device)
             if (wiimote) {
                 wiimote->is_wheel_mode = false;
                 wiimote->orientation_mode = WIIMOTE_ORIENTATION_VERTICAL;
-                u32 led_val = wiimote->status.leds ? wiimote->status.leds : BIT(wiimote->index);
+                u32 led_val = wiimote->status.leds;
+                if (!led_val) {
+                    int real_wiimotes = hci_state_get_active_real_wiimote_count();
+                    int player_slot = real_wiimotes + wiimote->index;
+                    if (player_slot >= 4)
+                        player_slot = 3;
+                    led_val = BIT(player_slot);
+                }
                 input_device_set_leds(input_device, led_val);
             }
         } else {
@@ -428,41 +400,24 @@ bool input_device_report_input(input_device_t *input_device)
         bm_map_wiimote(EGC_GAMEPAD_BUTTON_COUNT, gamepad_buttons, map, &wiimote_buttons);
     }
 
-    s16 ax = 0, ay = 0, az = 0;
-    if (input_device->device->desc->num_accelerometers > 0) {
-        ax = input->gamepad.accelerometer[0].x;
-        ay = input->gamepad.accelerometer[0].y;
-        az = input->gamepad.accelerometer[0].z;
-    }
-
-    /*
-     * Stream genuine physical accelerometer (ax, ay, az) continuously.
-     * Never override with artificial (0, 4096, 0), which caused orientation jumps
-     * and broke tilt controls in both Motion Plus and standard accelerometer games.
-     */
+    /* Continuously stream genuine physical accelerometer */
+    s16 ax = input->gamepad.accelerometer[0].x;
+    s16 ay = input->gamepad.accelerometer[0].y;
+    s16 az = input->gamepad.accelerometer[0].z;
     fake_wiimote_report_accelerometer(wiimote, ax, ay, az);
 
-    if (input_device->device->desc->num_gyroscopes > 0) {
-        s16 gyro_x = input->gamepad.gyroscope[0].pitch;
-        s16 gyro_y = input->gamepad.gyroscope[0].roll;
-        s16 gyro_z = input->gamepad.gyroscope[0].yaw;
-        fake_wiimote_report_gyroscope(wiimote, gyro_x, gyro_y, gyro_z);
-    }
+    /* Continuously stream genuine physical gyroscope */
+    s16 gyro_x = input->gamepad.gyroscope[0].pitch;
+    s16 gyro_y = input->gamepad.gyroscope[0].roll;
+    s16 gyro_z = input->gamepad.gyroscope[0].yaw;
+    fake_wiimote_report_gyroscope(wiimote, gyro_x, gyro_y, gyro_z);
 
-    ir_emu_mode = ir_emu_modes[input_device->ir_emu_mode_idx];
-    if (ir_emu_mode == BM_IR_EMULATION_MODE_NONE) {
-        bm_ir_dots_set_out_of_screen(ir_dots);
-    } else {
-        if (ir_emu_mode == BM_IR_EMULATION_MODE_DIRECT) {
-            bm_map_ir_direct(input->gamepad.touch_points[0].x,
-                             input->gamepad.touch_points[0].y,
-                             ax, ay,
-                             ir_dots);
-        } else {
-            bm_map_ir_analog_axis(ir_emu_mode, &input_device->ir_emu_state, EGC_GAMEPAD_AXIS_COUNT,
-                                  input->gamepad.axes, ir_analog_axis_map, ir_dots);
-        }
-    }
+    /* IR pointer is exclusively controlled via the Touchpad (direct mapping).
+     * Relative analog stick emulation is completely eliminated so right stick never moves pointer. */
+    bm_map_ir_direct(input->gamepad.touch_points[0].x,
+                     input->gamepad.touch_points[0].y,
+                     ax, ay,
+                     ir_dots);
 
     fake_wiimote_report_ir_dots(wiimote, ir_dots);
     fake_wiimote_report_battery(wiimote, input->gamepad.battery_level,
@@ -490,8 +445,5 @@ int input_device_send_speaker_data(input_device_t *input_device, const void *dat
 
 bool input_device_has_gyroscope(const input_device_t *input_device)
 {
-    if (input_device && input_device->device && input_device->device->desc) {
-        return input_device->device->desc->num_gyroscopes > 0;
-    }
-    return false;
+    return input_device && input_device->device != NULL;
 }

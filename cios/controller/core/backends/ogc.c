@@ -572,6 +572,7 @@ void ogc_ds4_attach_player2(egc_input_device_t *p1_dev)
     if (!sec_device || !primary) return;
 
     sec_device->usb.desc = primary->usb.desc;
+    sec_device->pub.desc = primary->pub.desc;
     sec_device->usb.vid = primary->usb.vid;
     sec_device->usb.pid = primary->usb.pid;
     sec_device->usb.host_fd = primary->usb.host_fd;

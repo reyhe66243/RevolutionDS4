@@ -8,6 +8,7 @@ void hci_state_reset(void);
 /* Used by fake Wiimote manager */
 u16 hci_con_handle_virt_alloc(void);
 bool hci_can_request_connection(void);
+int hci_state_get_active_real_wiimote_count(void);
 
 /* Used by the main request-handling loop */
 

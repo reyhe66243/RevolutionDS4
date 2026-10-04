@@ -66,7 +66,7 @@ static inline void fake_wiimote_mgr_check_assign_input_devices(void)
             fake_wiimote_init_state(&fake_wiimotes[i], input_device);
             input_device_assign_wiimote(input_device, &fake_wiimotes[i]);
             fake_wiimotes[i].active = true;
-            input_device_set_leds(input_device, BIT(i));
+            input_device_set_leds(input_device, fake_wiimotes[i].status.leds);
         }
     }
 }

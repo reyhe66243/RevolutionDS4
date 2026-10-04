@@ -51,6 +51,16 @@ bool hci_can_request_connection(void)
     return true;
 }
 
+int hci_state_get_active_real_wiimote_count(void)
+{
+    int count = 0;
+    for (int i = 0; i < ARRAY_SIZE(hci_virt_con_handle_map_table); i++) {
+        if (hci_virt_con_handle_map_table[i].valid)
+            count++;
+    }
+    return count;
+}
+
 /* HCI connection handle virt<->phys mapping */
 
 static bool hci_virt_con_handle_map(u16 phys, u16 virt)
