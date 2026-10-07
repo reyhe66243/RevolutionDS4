@@ -14,6 +14,11 @@ This project exists thanks to, and derives work from, the following projects:
     been extensively modified. Licensed under the GNU General Public License
     version 2.
 
+  Embedded Game Controller (EGC)
+    Source of the USB controller driver framework and Sony DS4 driver base
+    (included in Fakemote), created by Alberto Mardegan (mardy).
+    Licensed under the MIT License.
+
   Joypad OS
     Source of the input routing, player management and feedback services used
     by the adapter firmware. Licensed under the Apache License 2.0.

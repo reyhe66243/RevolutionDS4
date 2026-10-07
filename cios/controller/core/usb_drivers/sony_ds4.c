@@ -1,5 +1,7 @@
+// Embedded Game Controller (EGC) - Sony DS4 driver
+// Copyright (c) 2020-2024 Alberto Mardegan <info@mardy.it>
 // Modified for REVOLUTIONDS4, Copyright (c) 2026 Reyhe66243.
-// Licensed under the GNU General Public License version 2; see ../LICENSE.
+// Licensed under the MIT License; see LICENSE or https://opensource.org/licenses/MIT
 #include <limits.h>
 
 #include "driver_api.h"
